@@ -183,3 +183,399 @@ func TestAgentRegistration(t *testing.T) {
 		t.Errorf("agent.Get(AgentNameKiro).Name() = %q, want %q", ag.Name(), agent.AgentNameKiro)
 	}
 }
+
+func TestGetSessionDir(t *testing.T) {
+	ag := &KiroCLIAgent{}
+
+	// Test with override env var
+	t.Setenv("ENTIRE_TEST_KIRO_PROJECT_DIR", "/test/override")
+
+	dir, err := ag.GetSessionDir("/some/repo")
+	if err != nil {
+		t.Fatalf("GetSessionDir() error = %v", err)
+	}
+	if dir != "/test/override" {
+		t.Errorf("GetSessionDir() = %q, want /test/override", dir)
+	}
+}
+
+func TestGetSessionDir_DefaultPath(t *testing.T) {
+	ag := &KiroCLIAgent{}
+
+	// Make sure env var is not set
+	t.Setenv("ENTIRE_TEST_KIRO_PROJECT_DIR", "")
+
+	dir, err := ag.GetSessionDir("/some/repo")
+	if err != nil {
+		t.Fatalf("GetSessionDir() error = %v", err)
+	}
+
+	// Should be an absolute path containing .kiro/projects
+	if !filepath.IsAbs(dir) {
+		t.Errorf("GetSessionDir() should return absolute path, got %q", dir)
+	}
+}
+
+func TestReadSession(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Create a transcript file
+	transcriptPath := filepath.Join(tempDir, "transcript.jsonl")
+	transcriptContent := `{"type":"user","uuid":"u1","message":{"content":"hello"}}
+{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"hi"}]}}
+`
+	if err := os.WriteFile(transcriptPath, []byte(transcriptContent), 0o644); err != nil {
+		t.Fatalf("failed to write transcript: %v", err)
+	}
+
+	ag := &KiroCLIAgent{}
+	input := &agent.HookInput{
+		SessionID:  "test-session",
+		SessionRef: transcriptPath,
+	}
+
+	session, err := ag.ReadSession(input)
+	if err != nil {
+		t.Fatalf("ReadSession() error = %v", err)
+	}
+
+	if session.SessionID != "test-session" {
+		t.Errorf("SessionID = %q, want test-session", session.SessionID)
+	}
+	if session.AgentName != agent.AgentNameKiro {
+		t.Errorf("AgentName = %q, want %q", session.AgentName, agent.AgentNameKiro)
+	}
+	if len(session.NativeData) == 0 {
+		t.Error("NativeData is empty")
+	}
+}
+
+func TestReadSession_NoSessionRef(t *testing.T) {
+	ag := &KiroCLIAgent{}
+	input := &agent.HookInput{SessionID: "test-session"}
+
+	_, err := ag.ReadSession(input)
+	if err == nil {
+		t.Error("ReadSession() should error when SessionRef is empty")
+	}
+}
+
+func TestWriteSession(t *testing.T) {
+	tempDir := t.TempDir()
+	transcriptPath := filepath.Join(tempDir, "transcript.jsonl")
+
+	ag := &KiroCLIAgent{}
+	session := &agent.AgentSession{
+		SessionID:  "test-session",
+		AgentName:  agent.AgentNameKiro,
+		SessionRef: transcriptPath,
+		NativeData: []byte(`{"type":"user","uuid":"u1","message":{"content":"hello"}}`),
+	}
+
+	err := ag.WriteSession(session)
+	if err != nil {
+		t.Fatalf("WriteSession() error = %v", err)
+	}
+
+	// Verify file was written
+	data, err := os.ReadFile(transcriptPath)
+	if err != nil {
+		t.Fatalf("failed to read transcript: %v", err)
+	}
+
+	if string(data) != `{"type":"user","uuid":"u1","message":{"content":"hello"}}` {
+		t.Errorf("transcript content mismatch, got %q", string(data))
+	}
+}
+
+func TestWriteSession_Nil(t *testing.T) {
+	ag := &KiroCLIAgent{}
+
+	err := ag.WriteSession(nil)
+	if err == nil {
+		t.Error("WriteSession(nil) should error")
+	}
+}
+
+func TestWriteSession_WrongAgent(t *testing.T) {
+	ag := &KiroCLIAgent{}
+	session := &agent.AgentSession{
+		AgentName:  "claude-code",
+		SessionRef: "/path/to/file",
+		NativeData: []byte("{}"),
+	}
+
+	err := ag.WriteSession(session)
+	if err == nil {
+		t.Error("WriteSession() should error for wrong agent")
+	}
+}
+
+func TestWriteSession_NoSessionRef(t *testing.T) {
+	ag := &KiroCLIAgent{}
+	session := &agent.AgentSession{
+		AgentName:  agent.AgentNameKiro,
+		NativeData: []byte("{}"),
+	}
+
+	err := ag.WriteSession(session)
+	if err == nil {
+		t.Error("WriteSession() should error when SessionRef is empty")
+	}
+}
+
+func TestWriteSession_NoNativeData(t *testing.T) {
+	ag := &KiroCLIAgent{}
+	session := &agent.AgentSession{
+		AgentName:  agent.AgentNameKiro,
+		SessionRef: "/path/to/file",
+	}
+
+	err := ag.WriteSession(session)
+	if err == nil {
+		t.Error("WriteSession() should error when NativeData is empty")
+	}
+}
+
+// Chunking tests
+
+func TestChunkTranscript_SmallContent(t *testing.T) {
+	t.Parallel()
+	ag := &KiroCLIAgent{}
+
+	content := []byte(`{"type":"user","uuid":"u1","message":{"content":"hello"}}
+{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"hi"}]}}
+`)
+
+	chunks, err := ag.ChunkTranscript(content, agent.MaxChunkSize)
+	if err != nil {
+		t.Fatalf("ChunkTranscript() error = %v", err)
+	}
+	if len(chunks) != 1 {
+		t.Errorf("Expected 1 chunk, got %d", len(chunks))
+	}
+}
+
+func TestChunkTranscript_LargeContent(t *testing.T) {
+	t.Parallel()
+	ag := &KiroCLIAgent{}
+
+	// Create a JSONL transcript with many lines that exceeds maxSize
+	var lines []byte
+	for i := range 100 {
+		line := []byte(`{"type":"user","uuid":"u` + string(rune('0'+i%10)) + `","message":{"content":"message with some content to make it larger xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}}` + "\n")
+		lines = append(lines, line...)
+	}
+
+	// Use a small maxSize to force chunking
+	maxSize := 5000
+	chunks, err := ag.ChunkTranscript(lines, maxSize)
+	if err != nil {
+		t.Fatalf("ChunkTranscript() error = %v", err)
+	}
+
+	if len(chunks) < 2 {
+		t.Errorf("Expected at least 2 chunks for large content, got %d", len(chunks))
+	}
+
+	// Verify reassembly gives back all lines
+	reassembled, err := ag.ReassembleTranscript(chunks)
+	if err != nil {
+		t.Fatalf("ReassembleTranscript() error = %v", err)
+	}
+
+	// Count lines in original and reassembled
+	originalLines := countLines(lines)
+	reassembledLines := countLines(reassembled)
+
+	if reassembledLines != originalLines {
+		t.Errorf("Reassembled line count = %d, want %d", reassembledLines, originalLines)
+	}
+}
+
+func countLines(data []byte) int {
+	if len(data) == 0 {
+		return 0
+	}
+	count := 0
+	for _, b := range data {
+		if b == '\n' {
+			count++
+		}
+	}
+	return count
+}
+
+func TestChunkTranscript_EmptyContent(t *testing.T) {
+	t.Parallel()
+	ag := &KiroCLIAgent{}
+
+	chunks, err := ag.ChunkTranscript([]byte{}, agent.MaxChunkSize)
+	if err != nil {
+		t.Fatalf("ChunkTranscript() error = %v", err)
+	}
+	if len(chunks) != 0 {
+		t.Errorf("Expected 0 chunks for empty content, got %d", len(chunks))
+	}
+}
+
+func TestChunkTranscript_RoundTrip(t *testing.T) {
+	t.Parallel()
+	ag := &KiroCLIAgent{}
+
+	// Create a realistic JSONL transcript
+	original := []byte(`{"type":"user","uuid":"u1","message":{"content":"Write a hello world program"}}
+{"type":"assistant","uuid":"a1","message":{"content":[{"type":"tool_use","name":"fs_write","input":{"file_path":"main.go"}}]}}
+{"type":"user","uuid":"u2","message":{"content":"Now add a function"}}
+{"type":"assistant","uuid":"a2","message":{"content":[{"type":"tool_use","name":"edit","input":{"file_path":"main.go"}}]}}
+`)
+
+	// Use small maxSize to force chunking
+	maxSize := 200
+	chunks, err := ag.ChunkTranscript(original, maxSize)
+	if err != nil {
+		t.Fatalf("ChunkTranscript() error = %v", err)
+	}
+
+	reassembled, err := ag.ReassembleTranscript(chunks)
+	if err != nil {
+		t.Fatalf("ReassembleTranscript() error = %v", err)
+	}
+
+	if string(reassembled) != string(original) {
+		t.Errorf("Round-trip content mismatch:\ngot:  %q\nwant: %q", string(reassembled), string(original))
+	}
+}
+
+func TestReassembleTranscript_SingleChunk(t *testing.T) {
+	t.Parallel()
+	ag := &KiroCLIAgent{}
+
+	content := []byte(`{"type":"user","uuid":"u1","message":{"content":"hello"}}
+`)
+	chunks := [][]byte{content}
+
+	result, err := ag.ReassembleTranscript(chunks)
+	if err != nil {
+		t.Fatalf("ReassembleTranscript() error = %v", err)
+	}
+
+	if string(result) != string(content) {
+		t.Errorf("ReassembleTranscript() = %q, want %q", string(result), string(content))
+	}
+}
+
+func TestReassembleTranscript_MultipleChunks(t *testing.T) {
+	t.Parallel()
+	ag := &KiroCLIAgent{}
+
+	// Note: ChunkJSONL trims trailing newlines from chunks
+	chunk1 := []byte(`{"type":"user","uuid":"u1","message":{"content":"hello"}}`)
+	chunk2 := []byte(`{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"hi"}]}}`)
+	chunks := [][]byte{chunk1, chunk2}
+
+	result, err := ag.ReassembleTranscript(chunks)
+	if err != nil {
+		t.Fatalf("ReassembleTranscript() error = %v", err)
+	}
+
+	// ReassembleJSONL joins chunks with newlines
+	expected := string(chunk1) + "\n" + string(chunk2)
+	if string(result) != expected {
+		t.Errorf("ReassembleTranscript() = %q, want %q", string(result), expected)
+	}
+}
+
+func TestReassembleTranscript_EmptyChunks(t *testing.T) {
+	t.Parallel()
+	ag := &KiroCLIAgent{}
+
+	result, err := ag.ReassembleTranscript([][]byte{})
+	if err != nil {
+		t.Fatalf("ReassembleTranscript() error = %v", err)
+	}
+
+	if len(result) != 0 {
+		t.Errorf("Expected empty result for empty chunks, got %q", string(result))
+	}
+}
+
+func TestChunkTranscript_SingleOversizedLine(t *testing.T) {
+	t.Parallel()
+	ag := &KiroCLIAgent{}
+
+	// Create a single line that exceeds maxSize
+	largeContent := `{"type":"user","uuid":"u1","message":{"content":"` + string(make([]byte, 1000)) + `"}}` + "\n"
+	content := []byte(largeContent)
+
+	// maxSize smaller than the single line
+	maxSize := 100
+
+	// ChunkJSONL returns an error when a single line exceeds maxSize (it can't split a JSON object)
+	_, err := ag.ChunkTranscript(content, maxSize)
+	if err == nil {
+		t.Error("ChunkTranscript() should error when a single line exceeds maxSize")
+	}
+}
+
+func TestChunkTranscript_PreservesLineOrder(t *testing.T) {
+	t.Parallel()
+	ag := &KiroCLIAgent{}
+
+	// Create lines with numbered content to verify order
+	var lines []byte
+	for i := range 20 {
+		line := []byte(`{"type":"user","uuid":"u` + string(rune('A'+i)) + `","message":{"content":"message-` + string(rune('A'+i)) + `"}}` + "\n")
+		lines = append(lines, line...)
+	}
+
+	// Small maxSize to force multiple chunks
+	chunks, err := ag.ChunkTranscript(lines, 200)
+	if err != nil {
+		t.Fatalf("ChunkTranscript() error = %v", err)
+	}
+
+	reassembled, err := ag.ReassembleTranscript(chunks)
+	if err != nil {
+		t.Fatalf("ReassembleTranscript() error = %v", err)
+	}
+
+	// Verify content is identical
+	if string(reassembled) != string(lines) {
+		t.Error("Line order not preserved after chunking and reassembly")
+	}
+}
+
+func TestReadTranscript(t *testing.T) {
+	t.Parallel()
+	tempDir := t.TempDir()
+
+	// Create a transcript file
+	transcriptPath := filepath.Join(tempDir, "session.jsonl")
+	transcriptContent := `{"type":"user","uuid":"u1","message":{"content":"hello"}}
+{"type":"assistant","uuid":"a1","message":{"content":[{"type":"text","text":"hi"}]}}
+`
+	if err := os.WriteFile(transcriptPath, []byte(transcriptContent), 0o644); err != nil {
+		t.Fatalf("failed to write transcript: %v", err)
+	}
+
+	ag := &KiroCLIAgent{}
+	data, err := ag.ReadTranscript(transcriptPath)
+	if err != nil {
+		t.Fatalf("ReadTranscript() error = %v", err)
+	}
+
+	if string(data) != transcriptContent {
+		t.Errorf("ReadTranscript() content mismatch")
+	}
+}
+
+func TestReadTranscript_NonExistent(t *testing.T) {
+	t.Parallel()
+	ag := &KiroCLIAgent{}
+
+	_, err := ag.ReadTranscript("/nonexistent/path.jsonl")
+	if err == nil {
+		t.Error("ReadTranscript() should error for non-existent file")
+	}
+}
