@@ -93,6 +93,7 @@ type AgentType string
 const (
 	AgentNameClaudeCode AgentName = "claude-code"
 	AgentNameGemini     AgentName = "gemini"
+	AgentNameKiro       AgentName = "kiro"
 	AgentNameOpenCode   AgentName = "opencode"
 )
 
@@ -100,6 +101,7 @@ const (
 const (
 	AgentTypeClaudeCode AgentType = "Claude Code"
 	AgentTypeGemini     AgentType = "Gemini CLI"
+	AgentTypeKiro       AgentType = "Kiro CLI"
 	AgentTypeOpenCode   AgentType = "OpenCode"
 	AgentTypeUnknown    AgentType = "Agent" // Fallback for backwards compatibility
 )
